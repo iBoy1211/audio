@@ -3,3 +3,4 @@ uvicorn
 pydub
 ffmpeg-python
 python-multipart
+httpx
