@@ -6,17 +6,25 @@ import io
 
 app = FastAPI()
 
+
 def normalize_google_drive_url(url: str) -> str:
     """
     Convert common Google Drive share URLs to a direct download URL.
+
     Supports:
     - https://drive.google.com/file/d/FILE_ID/view?usp=...
     - https://drive.google.com/open?id=FILE_ID&...
+    - Direct links from drive.usercontent.google.com are returned as-is.
     """
     parsed = urlparse(url)
 
+    # drive.usercontent.google.com is already a direct download host
+    if "drive.usercontent.google.com" in parsed.netloc:
+        return url
+
     if "drive.google.com" not in parsed.netloc:
-        return url  # not a Drive URL, return as-is
+        # Not a Google Drive URL → return as-is
+        return url
 
     file_id = None
 
@@ -25,7 +33,7 @@ def normalize_google_drive_url(url: str) -> str:
         try:
             file_id = parsed.path.split("/file/d/")[1].split("/")[0]
         except IndexError:
-            pass
+            file_id = None
 
     # Pattern: ?id=FILE_ID
     if not file_id:
@@ -33,16 +41,17 @@ def normalize_google_drive_url(url: str) -> str:
         file_id = qs.get("id", [None])[0]
 
     if not file_id:
-        # Fallback: return original URL, maybe it's already direct
+        # Fallback: return original URL, maybe already usable
         return url
 
+    # Standard direct-download endpoint
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
 
 @app.post("/get-duration")
 async def get_audio_duration(
     file: UploadFile = File(None),
-    url: str = Form(None)
+    url: str = Form(None),
 ):
     # Validate input
     if not file and not url:
@@ -52,22 +61,34 @@ async def get_audio_duration(
 
     try:
         if url:
-            # Normalize Google Drive URLs if needed
+            # Normalize Drive share links if needed
             url_normalized = normalize_google_drive_url(url)
 
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url_normalized)
-                resp.raise_for_status()
-                content = resp.content
+            try:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    resp = await client.get(
+                        url_normalized,
+                        headers={
+                            # some CDNs / Google endpoints can be picky without UA
+                            "User-Agent": "audio-duration-bot/1.0"
+                        },
+                    )
+                    resp.raise_for_status()
+            except httpx.HTTPError as http_err:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to download audio from URL: {str(http_err)}",
+                )
 
-            # Try to infer filename from URL
+            content = resp.content
             filename = url_normalized.split("/")[-1] or "downloaded_audio"
+
         else:
             # File upload path
             content = await file.read()
             filename = file.filename or "uploaded_audio"
 
-        # Read audio with pydub
+        # Let pydub / ffmpeg detect format automatically
         audio = AudioSegment.from_file(io.BytesIO(content))
 
         # Duration in seconds
@@ -75,9 +96,12 @@ async def get_audio_duration(
 
         return {
             "filename": filename,
-            "duration_seconds": duration
+            "duration_seconds": duration,
         }
 
+    except HTTPException:
+        # re-raise our own HTTPExceptions
+        raise
     except Exception as e:
-        # You might want to log e in real app
-        raise HTTPException(status_code=500, detail=str(e))
+        # Any other internal error
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
